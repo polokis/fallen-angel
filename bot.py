@@ -1,115 +1,299 @@
 import discord
-from discord.ext import commands
-from discord import app_commands
+from discord.ext import commands, tasks
 import asyncio
 import os
+from datetime import datetime
 import logging
-from scraper import RTanksScraper
-from utils import create_player_embed, create_leaderboard_embed, create_error_embed
-from flask import Flask
-from threading import Thread
-import requests
-import time
+from scraper import RTanksPlayerScraper
+from translator import RTanksTranslator
+from config import RANK_EMOJIS, LEADERBOARD_CATEGORIES, GOLDBOX_EMOJI
+from keep_alive import keep_alive
 
-# Configure logging
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask app for health checks and self-pinging
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "RTanks Discord Bot is running!"
-
-@app.route('/health')
-def health():
-    return {"status": "healthy", "bot_connected": bot.is_ready() if 'bot' in globals() else False}
-
-# Bot setup
+# Bot setup with required intents
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Initialize scraper
-scraper = RTanksScraper()
+# Initialize scraper and translator
+scraper = RTanksPlayerScraper()
+translator = RTanksTranslator()
 
-# Available ranking categories
-RANKING_CATEGORIES = {
-    'experience': 'По опыту',
-    'crystals': 'По кристаллам', 
-    'gold_boxes': 'По золотым ящикам',
-    'kills': 'По киллам',
-    'efficiency': 'По эффективности'
-}
-
-# Self-pinging function to keep bot alive on Render
-def self_ping():
-    """Keep the bot alive by pinging itself every 5 minutes"""
-    render_url = os.getenv('RENDER_URL')
-    
-    # If no RENDER_URL is set, skip self-ping (for initial deployment)
-    if not render_url:
-        logger.info("RENDER_URL not set, skipping self-ping")
-        return
-    
-    while True:
-        try:
-            time.sleep(300)  # Wait 5 minutes
-            response = requests.get(f"{render_url}/health")
-            if response.status_code == 200:
-                logger.info("Self-ping successful")
-            else:
-                logger.warning(f"Self-ping failed with status {response.status_code}")
-        except Exception as e:
-            logger.error(f"Self-ping error: {e}")
-            time.sleep(60)  # Wait 1 minute before retrying
-
-def run_flask():
-    """Run Flask app in a separate thread"""
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+# Global variables for configuration
+LEADERBOARD_CHANNEL_ID = int(os.getenv('LEADERBOARD_CHANNEL_ID', '0'))
 
 @bot.event
 async def on_ready():
     logger.info(f'{bot.user} has connected to Discord!')
-    try:
-        # Sync commands globally
-        await bot.tree.sync()
-        logger.info("Commands synced successfully!")
-    except Exception as e:
-        logger.error(f"Failed to sync commands: {e}")
+    logger.info(f'Bot ID: {bot.user.id}')
+    logger.info(f'Bot is in {len(bot.guilds)} guilds')
     
-    # Set bot status
-    await bot.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.watching,
-            name="RTanks Online ratings"
-        )
+    # Wait a moment before syncing
+    await asyncio.sleep(1)
+    
+    # Sync slash commands globally
+    try:
+        logger.info("Starting command sync...")
+        # Add timeout to prevent hanging
+        synced = await asyncio.wait_for(bot.tree.sync(), timeout=30.0)
+        logger.info(f"Successfully synced {len(synced)} global command(s)")
+        for cmd in synced:
+            logger.info(f"Synced command: {cmd.name} - {cmd.description}")
+    except asyncio.TimeoutError:
+        logger.error("Command sync timed out - this usually means the bot lacks 'applications.commands' scope")
+        logger.error("Please re-invite the bot with both 'bot' and 'applications.commands' scopes")
+    except discord.Forbidden:
+        logger.error("Bot lacks permissions to register slash commands")
+        logger.error("Please re-invite the bot with 'applications.commands' scope")
+    except Exception as e:
+        logger.error(f"Failed to sync global commands: {e}")
+        logger.error(f"Error type: {type(e).__name__}")
+    
+    # List current commands in tree
+    logger.info(f"Commands in tree: {[cmd.name for cmd in bot.tree.get_commands()]}")
+    
+    # Start hourly leaderboard task
+    if not hourly_leaderboard.is_running():
+        hourly_leaderboard.start()
+
+def get_rank_emoji(rank_name: str) -> str:
+    """Get the appropriate emoji for a rank name"""
+    # Translate rank name to English if needed
+    translated_rank = translator.translate_rank(rank_name)
+    
+    # Always try lowercase first since our emoji keys are lowercase
+    lowercase_rank = translated_rank.lower()
+    
+    if lowercase_rank in RANK_EMOJIS:
+        return RANK_EMOJIS[lowercase_rank]
+    else:
+        # Try to find a partial match
+        for rank_key in RANK_EMOJIS.keys():
+            if lowercase_rank in rank_key or rank_key in lowercase_rank:
+                return RANK_EMOJIS[rank_key]
+        
+        # If no match found, return question mark
+        return "❓"
+
+def detect_activity_status(html_content: str, nickname: str) -> str:
+    """Detect if player is online or offline based on visual indicators"""
+    try:
+        # Look for activity indicators in the HTML content
+        html_lower = html_content.lower()
+        
+        # Check for online indicators (green dots, online text)
+        online_indicators = [
+            'color: green', 'color:green', 'background: green', 'background:green',
+            'онлайн', 'online', 'в сети', 'active'
+        ]
+        
+        # Check for offline indicators (grey dots, offline text)
+        offline_indicators = [
+            'color: gray', 'color:gray', 'color: grey', 'color:grey',
+            'background: gray', 'background:gray', 'background: grey', 'background:grey',
+            'оффлайн', 'offline', 'не в сети', 'inactive', 'последний раз'
+        ]
+        
+        # Check for online status
+        for indicator in online_indicators:
+            if indicator in html_lower:
+                return "🟢 Online"
+        
+        # Check for offline status
+        for indicator in offline_indicators:
+            if indicator in html_lower:
+                return "⚫ Offline"
+        
+        # Default to unknown status
+        return "❓ Unknown"
+        
+    except Exception as e:
+        logger.error(f"Error detecting activity status: {e}")
+        return "❓ Unknown"
+
+def create_simplified_player_embed(player_data: dict) -> discord.Embed:
+    """Create a simplified Discord embed for player statistics (for /user command)"""
+    
+    # Get rank emoji - make it bigger
+    rank_emoji = get_rank_emoji(player_data.get('rank', ''))
+    
+    # Create embed with player info
+    embed = discord.Embed(
+        title=f"🎮 {player_data['nickname']}",
+        description="RTanks Online Player Info",
+        color=0x00ff00,
+        timestamp=datetime.utcnow()
     )
+    
+    # Add rank with BIGGER emoji display
+    rank_text = translator.translate_text(player_data.get('rank', 'Unknown Rank'))
+    embed.add_field(
+        name="🎖️ Rank", 
+        value=f"# {rank_emoji} **{rank_text}**", 
+        inline=True
+    )
+    
+    # Add experience
+    embed.add_field(
+        name="⭐ Experience", 
+        value=f"**{player_data.get('experience', 'N/A'):,}**", 
+        inline=True
+    )
+    
+    # Add activity status (online/offline detection)
+    activity_status = player_data.get('activity_status', '❓ Unknown')
+    embed.add_field(
+        name="📡 Status", 
+        value=activity_status, 
+        inline=True
+    )
+    
+    # Add footer with button instructions
+    embed.add_field(
+        name="📊 More Details",
+        value="Click the **+** button below to view detailed statistics!",
+        inline=False
+    )
+    
+    embed.set_footer(
+        text="RTanks Online Statistics • Click + for details",
+        icon_url="https://ratings.ranked-rtanks.online/public/images/logo.png"
+    )
+    
+    return embed
+
+def create_detailed_player_embed(player_data: dict) -> discord.Embed:
+    """Create a detailed Discord embed for player statistics"""
+    
+    # Get rank emoji
+    rank_emoji = get_rank_emoji(player_data.get('rank', ''))
+    
+    # Create embed with player info
+    embed = discord.Embed(
+        title=f"{rank_emoji} {player_data['nickname']} - Detailed Stats",
+        description="RTanks Online Player Statistics",
+        color=0x0099ff,
+        timestamp=datetime.utcnow()
+    )
+    
+    # Combat Statistics Section
+    combat_stats = []
+    
+    # Add Destroyed
+    destroyed = player_data.get('kills', 0)  # Using kills as destroyed
+    if destroyed:
+        combat_stats.append(f"💥 **Destroyed:** {destroyed:,}")
+    
+    # Add Hit (if available in future scraping updates)
+    hit = player_data.get('hit', 'N/A')
+    if hit and hit != 'N/A':
+        combat_stats.append(f"🎯 **Hit:** {hit:,}")
+    
+    # Add K/D Ratio
+    kd_ratio = player_data.get('kd_ratio', 0)
+    if kd_ratio:
+        combat_stats.append(f"⚔️ **K/D Ratio:** {kd_ratio}")
+    
+    if combat_stats:
+        embed.add_field(
+            name="⚔️ Combat Statistics",
+            value="\n".join(combat_stats),
+            inline=False
+        )
+    
+    # Player Information Section
+    player_info = []
+    
+    # Add Group
+    group = player_data.get('group', 'Player')
+    player_info.append(f"👥 **Group:** {group}")
+    
+    # Add Premium Status
+    premium = player_data.get('premium', False)
+    premium_status = "✅ Yes" if premium else "❌ No"
+    player_info.append(f"💎 **Premium:** {premium_status}")
+    
+    # Add Gold Boxes with custom emoji
+    goldboxes = player_data.get('goldboxes', 0)
+    player_info.append(f"{GOLDBOX_EMOJI} **Gold Boxes:** {goldboxes:,}")
+    
+    if player_info:
+        embed.add_field(
+            name="ℹ️ Player Information", 
+            value="\n".join(player_info),
+            inline=False
+        )
+    
+    # Equipment Section (only turrets and hulls)
+    equipment_text = player_data.get('equipment', '')
+    if equipment_text:
+        # Parse equipment to show only turrets and hulls
+        equipment_lines = []
+        
+        # This would need to be enhanced based on actual equipment data structure
+        # For now, show the equipment as is
+        equipment_lines.append(f"🔫 **Equipment:** {equipment_text}")
+        
+        if equipment_lines:
+            embed.add_field(
+                name="🎯 Equipment (Turrets & Hulls)",
+                value="\n".join(equipment_lines),
+                inline=False
+            )
+    
+    # Add current rankings section
+    rankings_data = []
+    if player_data.get('experience_rank') and player_data.get('experience_rank') != 'N/A':
+        rankings_data.append(f"📊 **By Experience:** #{player_data.get('experience_rank')}")
+    if player_data.get('crystals_rank') and player_data.get('crystals_rank') != 'N/A':
+        rankings_data.append(f"💎 **By Crystals:** #{player_data.get('crystals_rank')}")
+    if player_data.get('kills_rank') and player_data.get('kills_rank') != 'N/A':
+        rankings_data.append(f"⚔️ **By Kills:** #{player_data.get('kills_rank')}")
+    if player_data.get('efficiency_rank') and player_data.get('efficiency_rank') != 'N/A':
+        rankings_data.append(f"🏆 **By Efficiency:** #{player_data.get('efficiency_rank')}")
+    
+    if rankings_data:
+        embed.add_field(
+            name="🏆 Current Rankings", 
+            value="\n".join(rankings_data), 
+            inline=False
+        )
+    
+    embed.set_footer(
+        text="RTanks Online Statistics",
+        icon_url="https://ratings.ranked-rtanks.online/public/images/logo.png"
+    )
+    
+    return embed
 
 class PlayerDetailsView(discord.ui.View):
+    """View for expandable player details with + button"""
+    
     def __init__(self, player_data: dict):
-        super().__init__(timeout=300)
+        super().__init__(timeout=300)  # 5 minute timeout
         self.player_data = player_data
-
+    
     @discord.ui.button(label='+', style=discord.ButtonStyle.secondary, emoji='📊')
     async def show_details(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Show detailed player statistics"""
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(ephemeral=True)
         
         try:
             # Create detailed embed
-            embed = create_player_embed(self.player_data, detailed=True)
+            embed = create_detailed_player_embed(self.player_data)
             await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
             logger.error(f"Error showing player details: {e}")
-            embed = create_error_embed(
-                "Error loading details",
-                "There was an error loading detailed player information."
+            embed = discord.Embed(
+                title="❌ Error",
+                description="There was an error loading detailed player information.",
+                color=0xff0000
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
-
+    
     async def on_timeout(self):
         # Disable button when view times out
         for item in self.children:
@@ -117,141 +301,237 @@ class PlayerDetailsView(discord.ui.View):
                 item.disabled = True
 
 @bot.tree.command(name="user", description="Get simplified RTanks Online player info with expandable details")
+@discord.app_commands.describe(nickname="The player's nickname to look up")
 async def user_stats(interaction: discord.Interaction, nickname: str):
-    """Get simplified player statistics with expandable detailed view"""
-    await interaction.response.defer(thinking=True)
+    """Simplified player stats command with expandable details"""
+    
+    # Defer the response since scraping might take time
+    await interaction.response.defer()
     
     try:
-        # Validate nickname
-        if not nickname or len(nickname.strip()) == 0:
-            embed = create_error_embed("Invalid nickname", "Please provide a valid player nickname.")
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            return
-        
-        # Clean nickname
-        nickname = nickname.strip()
-        
-        # Get player data
+        # Scrape player data
         player_data = await scraper.get_player_stats(nickname)
         
         if not player_data:
-            embed = create_error_embed(
-                "Player not found", 
-                f"Could not find player '{nickname}' in RTanks Online ratings.\n"
-                "Please check the spelling and try again."
+            embed = discord.Embed(
+                title="❌ Player Not Found",
+                description=f"No player found with nickname: **{nickname}**",
+                color=0xff0000
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            embed.add_field(
+                name="💡 Tip", 
+                value="Make sure the nickname is spelled correctly and the player exists in RTanks Online.",
+                inline=False
+            )
+            await interaction.followup.send(embed=embed)
             return
         
-        # Create simplified embed with player data
-        embed = create_player_embed(player_data, simplified=True)
+        # Add activity status to player data by checking the HTML
+        if hasattr(scraper, '_last_html_content'):
+            player_data['activity_status'] = detect_activity_status(scraper._last_html_content, nickname)
+        else:
+            player_data['activity_status'] = "❓ Unknown"
+        
+        # Create simplified embed with expandable details
+        embed = create_simplified_player_embed(player_data)
         view = PlayerDetailsView(player_data)
         await interaction.followup.send(embed=embed, view=view)
         
     except Exception as e:
         logger.error(f"Error fetching player stats for {nickname}: {e}")
-        embed = create_error_embed(
-            "Error fetching player data",
-            "There was an error retrieving the player statistics. Please try again later."
+        
+        embed = discord.Embed(
+            title="⚠️ Error",
+            description="Failed to retrieve player statistics.",
+            color=0xffa500
         )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="player", description="Get detailed RTanks Online player statistics")
+@discord.app_commands.describe(nickname="The player's nickname to look up")
 async def player_stats(interaction: discord.Interaction, nickname: str):
-    """Get detailed player statistics from RTanks Online ratings website"""
-    await interaction.response.defer(thinking=True)
+    """Detailed player stats command"""
+    
+    # Defer the response since scraping might take time
+    await interaction.response.defer()
     
     try:
-        # Validate nickname
-        if not nickname or len(nickname.strip()) == 0:
-            embed = create_error_embed("Invalid nickname", "Please provide a valid player nickname.")
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            return
-        
-        # Clean nickname
-        nickname = nickname.strip()
-        
-        # Get player data
+        # Scrape player data
         player_data = await scraper.get_player_stats(nickname)
         
+        # Debug log the extracted data
+        if player_data:
+            logger.info(f"Player data for {nickname}: Experience={player_data.get('experience')}, Kills={player_data.get('kills')}, Deaths={player_data.get('deaths')}, K/D={player_data.get('kd_ratio')}")
+        
         if not player_data:
-            embed = create_error_embed(
-                "Player not found", 
-                f"Could not find player '{nickname}' in RTanks Online ratings.\n"
-                "Please check the spelling and try again."
+            embed = discord.Embed(
+                title="❌ Player Not Found",
+                description=f"No player found with nickname: **{nickname}**",
+                color=0xff0000
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            embed.add_field(
+                name="💡 Tip", 
+                value="Make sure the nickname is spelled correctly and the player exists in RTanks Online.",
+                inline=False
+            )
+            await interaction.followup.send(embed=embed)
             return
         
-        # Create detailed embed with player data
-        embed = create_player_embed(player_data, detailed=True)
+        # Create and send detailed embed
+        embed = create_detailed_player_embed(player_data)
         await interaction.followup.send(embed=embed)
         
     except Exception as e:
         logger.error(f"Error fetching player stats for {nickname}: {e}")
-        embed = create_error_embed(
-            "Error fetching player data",
-            "There was an error retrieving the player statistics. Please try again later."
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-class CategorySelect(discord.ui.Select):
-    def __init__(self):
-        options = []
-        for key, value in RANKING_CATEGORIES.items():
-            options.append(discord.SelectOption(
-                label=value,
-                value=key,
-                description=f"Top players by {value.lower()}"
-            ))
         
-        super().__init__(
-            placeholder="Choose a ranking category...",
-            min_values=1,
-            max_values=1,
-            options=options
+        embed = discord.Embed(
+            title="⚠️ Error",
+            description="Failed to retrieve player statistics.",
+            color=0xffa500
         )
+        await interaction.followup.send(embed=embed)
+
+class LeaderboardView(discord.ui.View):
+    """View for leaderboard category selection"""
     
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
+    def __init__(self):
+        super().__init__(timeout=60)
+    
+    @discord.ui.select(
+        placeholder="Choose a leaderboard category...",
+        options=[
+            discord.SelectOption(
+                label="Experience Leaderboard",
+                description="Top players by earned experience",
+                value="experience",
+                emoji="📊"
+            ),
+            discord.SelectOption(
+                label="Crystals Leaderboard", 
+                description="Top players by earned crystals",
+                value="crystals",
+                emoji="💎"
+            ),
+            discord.SelectOption(
+                label="Kills Leaderboard",
+                description="Top players by total kills",
+                value="kills", 
+                emoji="⚔️"
+            ),
+            discord.SelectOption(
+                label="Efficiency Leaderboard",
+                description="Top players by efficiency rating",
+                value="efficiency",
+                emoji="🏆"
+            )
+        ]
+    )
+    async def select_leaderboard(self, interaction: discord.Interaction, select: discord.ui.Select):
+        await interaction.response.defer()
         
         try:
-            category = self.values[0]
-            category_name = RANKING_CATEGORIES[category]
-            
-            # Get leaderboard data
+            category = select.values[0]
             leaderboard_data = await scraper.get_leaderboard(category)
             
             if not leaderboard_data:
-                embed = create_error_embed(
-                    "Leaderboard unavailable",
-                    f"Could not fetch {category_name} leaderboard. Please try again later."
+                embed = discord.Embed(
+                    title="❌ Leaderboard Unavailable",
+                    description=f"Could not retrieve {category} leaderboard data.",
+                    color=0xff0000
                 )
-                await interaction.followup.send(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed)
                 return
             
-            # Create embed with leaderboard data
-            embed = create_leaderboard_embed(category_name, leaderboard_data)
+            # Create leaderboard embed
+            embed = create_leaderboard_embed(leaderboard_data, category)
             await interaction.followup.send(embed=embed)
             
         except Exception as e:
-            logger.error(f"Error fetching leaderboard for {category}: {e}")
-            embed = create_error_embed(
-                "Error fetching leaderboard",
-                "There was an error retrieving the leaderboard data. Please try again later."
+            logger.error(f"Error fetching leaderboard for {select.values[0]}: {e}")
+            
+            embed = discord.Embed(
+                title="⚠️ Error",
+                description="Failed to retrieve leaderboard data.",
+                color=0xffa500
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed)
 
-class CategoryView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)  # 5 minute timeout
-        self.add_item(CategorySelect())
+def create_leaderboard_embed(leaderboard_data: list, category: str) -> discord.Embed:
+    """Create a Discord embed for leaderboard data with fixed emojis"""
     
-    async def on_timeout(self):
-        # Disable all items when view times out
-        for item in self.children:
-            if hasattr(item, 'disabled'):
-                item.disabled = True
+    category_info = LEADERBOARD_CATEGORIES.get(category, {})
+    title = category_info.get('title', f'{category.title()} Leaderboard')
+    emoji = category_info.get('emoji', '🏆')
+    
+    embed = discord.Embed(
+        title=f"{emoji} {title}",
+        description=f"Top 10 players in RTanks Online",
+        color=0x00ff00,
+        timestamp=datetime.utcnow()
+    )
+    
+    # Add top 10 players with CORRECT emojis
+    leaderboard_text = ""
+    for i, player in enumerate(leaderboard_data[:10], 1):
+        rank_emoji = get_rank_emoji(player.get('rank', ''))
+        
+        # Format position with PROPER medals for top 3
+        if i == 1:
+            position = "🥇"
+        elif i == 2:
+            position = "🥈" 
+        elif i == 3:
+            position = "🥉"
+        else:
+            position = f"{i}."
+        
+        value = player.get('value', 'N/A')
+        if isinstance(value, (int, float)) and value >= 1000:
+            value = f"{value:,}"
+        
+        # Truncate long nicknames to prevent field overflow
+        nickname = player['nickname']
+        if len(nickname) > 15:
+            nickname = nickname[:12] + "..."
+        
+        leaderboard_text += f"{position} {rank_emoji} **{nickname}** - {value}\n"
+    
+    # Split into multiple fields if still too long
+    if len(leaderboard_text) > 1000:
+        # Split into two fields
+        lines = leaderboard_text.strip().split('\n')
+        mid_point = len(lines) // 2
+        
+        embed.add_field(
+            name="Rankings 1-5",
+            value="\n".join(lines[:mid_point]),
+            inline=True
+        )
+        embed.add_field(
+            name="Rankings 6-10",
+            value="\n".join(lines[mid_point:]),
+            inline=True
+        )
+    else:
+        embed.add_field(
+            name="Rankings",
+            value=leaderboard_text,
+            inline=False
+        )
+    
+    # Add timestamp info
+    embed.add_field(
+        name="ℹ️ Update Info",
+        value="Rankings update regularly on the RTanks website.\nData refreshed every 15 minutes.",
+        inline=False
+    )
+    
+    embed.set_footer(
+        text="RTanks Online Statistics",
+        icon_url="https://ratings.ranked-rtanks.online/public/images/logo.png"
+    )
+    
+    return embed
 
 @bot.tree.command(name="top", description="View RTanks Online leaderboards by category")
 async def top_players(interaction: discord.Interaction):
@@ -263,12 +543,12 @@ async def top_players(interaction: discord.Interaction):
     )
     embed.add_field(
         name="Available Categories",
-        value="\n".join([f"• {name}" for name in RANKING_CATEGORIES.values()]),
+        value="📊 Experience Leaderboard\n💎 Crystals Leaderboard\n⚔️ Kills Leaderboard\n🏆 Efficiency Leaderboard",
         inline=False
     )
     embed.set_footer(text="Select a category from the dropdown below")
     
-    view = CategoryView()
+    view = LeaderboardView()
     await interaction.response.send_message(embed=embed, view=view)
 
 @bot.tree.command(name="about", description="Information about the RTanks Online bot")
@@ -276,7 +556,7 @@ async def about(interaction: discord.Interaction):
     """Show information about the bot"""
     embed = discord.Embed(
         title="🤖 RTanks Online Bot",
-        description="A Discord bot for viewing RTanks Online player statistics and leaderboards",
+        description="Enhanced Discord bot for viewing RTanks Online player statistics and leaderboards",
         color=0x0099ff
     )
     embed.add_field(
@@ -288,69 +568,48 @@ async def about(interaction: discord.Interaction):
         inline=False
     )
     embed.add_field(
-        name="Data Source",
-        value="[RTanks Online Ratings](https://ratings.ranked-rtanks.online/)",
+        name="Features",
+        value="• Real-time player statistics and activity status\n"
+              "• Interactive leaderboard categories with proper emojis\n"
+              "• Expandable player details with (+) button\n"
+              "• Support for Russian text with translation\n"
+              "• Cached data for improved performance",
         inline=False
     )
     embed.add_field(
-        name="Features",
-        value="• Real-time player statistics and activity status\n"
-              "• Interactive leaderboard categories\n"
-              "• Expandable player details\n"
-              "• Support for Russian text\n"
-              "• Cached data for performance",
+        name="Data Source",
+        value="[RTanks Online Ratings](https://ratings.ranked-rtanks.online/)",
         inline=False
     )
     embed.set_footer(text="RTanks Online - Nostalgic tank battles restored!")
     
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    """Global error handler for slash commands"""
-    logger.error(f"Command error: {error}")
-    
-    if isinstance(error, app_commands.CommandOnCooldown):
-        embed = create_error_embed(
-            "Command on cooldown",
-            f"This command is on cooldown. Try again in {error.retry_after:.2f} seconds."
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    else:
-        embed = create_error_embed(
-            "Command error",
-            "An unexpected error occurred while processing your command."
-        )
-        if not interaction.response.is_done():
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        else:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+@tasks.loop(hours=1)
+async def hourly_leaderboard():
+    """Hourly task for leaderboard updates"""
+    try:
+        if LEADERBOARD_CHANNEL_ID:
+            channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
+            if channel:
+                # This can be used for automated leaderboard posts
+                logger.info("Hourly leaderboard task executed")
+    except Exception as e:
+        logger.error(f"Error in hourly leaderboard task: {e}")
 
-# Error handling for the bot
-@bot.event
-async def on_error(event, *args, **kwargs):
-    logger.error(f"Bot error in {event}: {args}")
-
+# Start the bot
 if __name__ == "__main__":
-    # Get bot token from environment
-    token = os.getenv("DISCORD_TOKEN")
+    # Start keep_alive for Render deployment
+    keep_alive()
+    
+    # Run the bot
+    token = os.getenv('DISCORD_TOKEN')
     if not token:
         logger.error("DISCORD_TOKEN environment variable not set!")
         exit(1)
-    
-    # Start Flask server in a separate thread
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    
-    # Start self-ping in a separate thread
-    ping_thread = Thread(target=self_ping)
-    ping_thread.daemon = True
-    ping_thread.start()
-    
-    logger.info("Starting Discord bot...")
     
     try:
         bot.run(token)
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
+        exit(1)
