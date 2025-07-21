@@ -1,120 +1,136 @@
+import aiohttp
 import asyncio
-import httpx
-import re
-import time
 from bs4 import BeautifulSoup
-from typing import Optional, Dict, List, Any
 import logging
+import re
+from typing import Dict, List, Optional
+import trafilatura
 
 logger = logging.getLogger(__name__)
 
-class RTanksScraper:
+class RTanksPlayerScraper:
+    """Scraper for RTanks Online player statistics and leaderboards"""
+    
     def __init__(self):
         self.base_url = "https://ratings.ranked-rtanks.online"
         self.session = None
-        self.cache = {}
-        self.cache_timeout = 300  # 5 minutes cache
+        self._last_html_content = ""  # Store last HTML for activity detection
         
-        # Headers to mimic a real browser
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        }
-    
-    async def get_session(self):
-        """Get or create httpx session"""
-        if self.session is None or self.session.is_closed:
-            self.session = httpx.AsyncClient(
-                timeout=30.0,
-                headers=self.headers
+    async def _get_session(self):
+        """Get or create aiohttp session"""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
             )
         return self.session
     
-    async def close_session(self):
-        """Close the httpx session"""
-        if self.session and not self.session.is_closed:
-            await self.session.aclose()
-    
-    def is_cache_valid(self, cache_key: str) -> bool:
-        """Check if cached data is still valid"""
-        if cache_key not in self.cache:
-            return False
-        
-        cached_time = self.cache[cache_key].get('timestamp', 0)
-        return time.time() - cached_time < self.cache_timeout
-    
-    def get_from_cache(self, cache_key: str) -> Optional[Any]:
-        """Get data from cache if valid"""
-        if self.is_cache_valid(cache_key):
-            return self.cache[cache_key]['data']
-        return None
-    
-    def set_cache(self, cache_key: str, data: Any):
-        """Set data in cache"""
-        self.cache[cache_key] = {
-            'data': data,
-            'timestamp': time.time()
-        }
-    
-    async def fetch_page(self, url: str) -> Optional[str]:
-        """Fetch a web page with error handling"""
+    async def _fetch_page(self, url: str) -> Optional[str]:
+        """Fetch a web page and return its content"""
         try:
-            session = await self.get_session()
-            response = await session.get(url)
-            if response.status_code == 200:
-                return response.text
-            else:
-                logger.warning(f"HTTP {response.status_code} for URL: {url}")
-                return None
-        except httpx.TimeoutException:
-            logger.error(f"Timeout fetching URL: {url}")
-            return None
+            session = await self._get_session()
+            async with session.get(url) as response:
+                if response.status == 200:
+                    content = await response.text()
+                    self._last_html_content = content  # Store for activity detection
+                    return content
+                else:
+                    logger.error(f"HTTP {response.status} when fetching {url}")
+                    return None
         except Exception as e:
-            logger.error(f"Error fetching URL {url}: {e}")
+            logger.error(f"Error fetching {url}: {e}")
             return None
-
-    def detect_activity_status(self, soup: BeautifulSoup, nickname: str) -> str:
+    
+    def _extract_rank_from_image(self, img_src: str) -> str:
+        """Extract rank name from image URL"""
+        # Image URLs are like: https://i.imgur.com/a3UCeT5.png
+        # We need to map these to rank names based on the pattern seen in the data
+        rank_mappings = {
+            'a3UCeT5.png': 'Warrant Officer 5',  # Уорэнт-офицер 5
+            'O6Tb9li.png': 'Colonel',             # Полковник
+            'rCN2gJm.png': 'Lieutenant Colonel',  # Подполковник
+            'R69LmLt.png': 'Major',               # Майор
+            'Ljy2jDX.png': 'Captain',             # Капитан
+            'lTXxLVJ.png': 'First Lieutenant',    # Первый лейтенант
+            'iTyjOt3.png': 'Second Lieutenant',   # Второй лейтенант
+            'BIr8vRX.png': 'Warrant Officer 4',  # Уорэнт-офицер 4
+            'sppjRis.png': 'Warrant Officer 3',  # Уорэнт-офицер 3
+            'LATOpxZ.png': 'Warrant Officer 2',  # Уорэнт-офицер 2
+            'ekbJYyf.png': 'Warrant Officer 1',  # Уорэнт-офицер 1
+            'GzJRzgz.png': 'Master Sergeant',    # Мастер-сержант
+            'pxzNyxi.png': 'Sergeant First Class', # Старший сержант
+            'UWup9qJ.png': 'Staff Sergeant',     # Штаб-сержант
+            'dSE90bT.png': 'Sergeant',           # Сержант
+            'paF1myt.png': 'Corporal',           # Капрал
+            'wPZnaG0.png': 'Lance Corporal',     # Младший капрал
+            'Or6Ajto.png': 'Private First Class', # Рядовой первого класса
+            'AYAs02w.png': 'Private',            # Рядовой
+            'M4GBQIq.png': 'Recruit',            # Новобранец
+            'Q2YgFQ1.png': 'Legend',             # Легенда
+            'rO3Hs5f.png': 'Generalissimo',      # Генералиссимус
+            'OQEHkm7.png': 'General',            # Генерал
+            'BNZpCPo.png': 'Lieutenant General', # Генерал-лейтенант
+            'eQXJOZE.png': 'Major General',      # Генерал-майор
+            'Sluzy': 'Brigadier General'         # Бригадный генерал
+        }
+        
+        # Extract filename from URL
+        if 'imgur.com' in img_src:
+            filename = img_src.split('/')[-1]
+            return rank_mappings.get(filename, 'Unknown Rank')
+        
+        return 'Unknown Rank'
+    
+    def _detect_activity_status(self, soup: BeautifulSoup, nickname: str) -> str:
         """Detect if player is online or offline based on visual indicators"""
         try:
-            # Look for activity indicators near the player name
-            # Green dot indicators for online status
-            online_indicators = soup.find_all(['span', 'div', 'i'], class_=re.compile(r'online|active|green', re.I))
-            offline_indicators = soup.find_all(['span', 'div', 'i'], class_=re.compile(r'offline|inactive|grey|gray', re.I))
+            # Convert soup to string for easier searching
+            html_content = str(soup).lower()
             
-            # Check for color-based indicators in style attributes
-            elements_with_color = soup.find_all(attrs={"style": re.compile(r'color\s*:\s*green|background.*green', re.I)})
-            if elements_with_color:
-                return "🟢 Online"
+            # Check for online indicators (green dots, online text)
+            online_indicators = [
+                'color: green', 'color:green', 'background: green', 'background:green',
+                'rgb(0, 255, 0)', 'rgb(0,255,0)', '#00ff00', '#0f0',
+                'онлайн', 'online', 'в сети', 'active', 'зеленый'
+            ]
             
-            elements_with_gray = soup.find_all(attrs={"style": re.compile(r'color\s*:\s*gr[ae]y|background.*gr[ae]y', re.I)})
-            if elements_with_gray:
-                return "⚫ Offline"
+            # Check for offline indicators (grey dots, offline text)
+            offline_indicators = [
+                'color: gray', 'color:gray', 'color: grey', 'color:grey',
+                'background: gray', 'background:gray', 'background: grey', 'background:grey',
+                'rgb(128, 128, 128)', 'rgb(128,128,128)', '#808080', '#888',
+                'оффлайн', 'offline', 'не в сети', 'inactive', 'последний раз', 'серый'
+            ]
             
-            # Check for common online/offline text indicators
-            page_text = soup.get_text().lower()
-            if 'онлайн' in page_text or 'online' in page_text:
-                return "🟢 Online"
-            elif 'оффлайн' in page_text or 'offline' in page_text:
-                return "⚫ Offline"
+            # Look for status indicators near the player name
+            player_section = soup.find(text=re.compile(nickname, re.I))
+            if player_section:
+                parent = player_section.parent
+                if parent:
+                    # Check the parent and nearby elements for status indicators
+                    parent_html = str(parent).lower()
+                    
+                    # Check for online status
+                    for indicator in online_indicators:
+                        if indicator in parent_html:
+                            return "🟢 Online"
+                    
+                    # Check for offline status
+                    for indicator in offline_indicators:
+                        if indicator in parent_html:
+                            return "⚫ Offline"
             
-            # Check for status indicators in images
-            status_imgs = soup.find_all('img', src=re.compile(r'online|offline|status', re.I))
-            for img in status_imgs:
-                src = img.get('src', '').lower()
-                if 'online' in src or 'green' in src:
+            # Global check for online status
+            for indicator in online_indicators:
+                if indicator in html_content:
                     return "🟢 Online"
-                elif 'offline' in src or 'grey' in src or 'gray' in src:
-                    return "⚫ Offline"
             
-            # Look for last seen information
-            last_seen_pattern = re.compile(r'последн[ийая].*вход|last.*seen|был.*онлайн', re.I)
-            last_seen = soup.find(text=last_seen_pattern)
-            if last_seen:
-                return "⚫ Offline"
+            # Global check for offline status
+            for indicator in offline_indicators:
+                if indicator in html_content:
+                    return "⚫ Offline"
             
             # Default to unknown status
             return "❓ Unknown"
@@ -122,105 +138,90 @@ class RTanksScraper:
         except Exception as e:
             logger.error(f"Error detecting activity status: {e}")
             return "❓ Unknown"
-    
-    def parse_player_profile(self, html: str, nickname: str) -> Optional[Dict]:
-        """Parse player profile HTML with enhanced data extraction"""
+
+    async def get_player_stats(self, nickname: str) -> Optional[Dict]:
+        """Get player statistics by nickname"""
         try:
-            soup = BeautifulSoup(html, 'html.parser')
+            # Construct player profile URL
+            player_url = f"{self.base_url}/user/{nickname}"
             
-            # Check if player exists
-            if "профиль игрока" not in html.lower() and nickname.lower() not in html.lower():
+            # Fetch player page
+            html_content = await self._fetch_page(player_url)
+            if not html_content:
                 return None
             
+            # Parse HTML with BeautifulSoup
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Extract player data
             player_data = {
                 'nickname': nickname,
-                'rank': None,
-                'rank_emoji': None,
-                'experience': None,
-                'kills': None,
-                'deaths': None,
-                'kd_ratio': None,
-                'gold_boxes': None,
-                'premium': None,
-                'group': None,
-                'activity_status': self.detect_activity_status(soup, nickname),
-                'destroyed': None,
-                'hit': None,
-                'rankings': {},
-                'equipment': {
-                    'turrets': [],
-                    'hulls': []
-                }
+                'rank': 'Unknown',
+                'experience': 0,
+                'kills': 0,
+                'deaths': 0,
+                'kd_ratio': 0.0,
+                'premium': False,
+                'goldboxes': 0,
+                'crystals_rank': 'N/A',
+                'efficiency_rank': 'N/A',
+                'experience_rank': 'N/A',
+                'kills_rank': 'N/A',
+                'equipment': '',
+                'activity_status': self._detect_activity_status(soup, nickname),
+                'hit': 'N/A',  # Added for future implementation
+                'destroyed': 0,  # Will use kills value
+                'group': 'Player'  # Default group
             }
             
-            # Enhanced rank detection with emoji mapping
-            rank_patterns = [
-                r'генерал',
-                r'полковник',
-                r'подполковник', 
-                r'майор',
-                r'капитан',
-                r'старший лейтенант',
-                r'лейтенант',
-                r'младший лейтенант',
-                r'старший прапорщик',
-                r'прапорщик',
-                r'старший сержант',
-                r'сержант',
-                r'младший сержант',
-                r'ефрейтор',
-                r'рядовой'
-            ]
+            # Extract rank from image or text
+            rank_img = soup.find('img', src=re.compile(r'imgur\.com'))
+            if rank_img:
+                player_data['rank'] = self._extract_rank_from_image(rank_img['src'])
             
-            # Find rank in text
-            page_text = soup.get_text().lower()
-            for pattern in rank_patterns:
-                if re.search(pattern, page_text):
-                    player_data['rank'] = pattern.title()
-                    player_data['rank_emoji'] = self.get_rank_emoji(pattern)
+            # Always try to extract rank from text since image method may not work
+            # Look for any font element with gray color (more flexible approach)
+            gray_fonts = soup.find_all('font', attrs={'style': lambda x: x and 'gray' in str(x).lower()})
+            for font in gray_fonts:
+                rank_text = font.get_text(strip=True)
+                if rank_text and 2 < len(rank_text) < 30:  # Reasonable rank name length
+                    player_data['rank'] = rank_text
                     break
             
-            # Extract experience with multiple patterns
-            exp_patterns = [
-                re.compile(r'опыт[:\s]*(\d+)', re.I),
-                re.compile(r'experience[:\s]*(\d+)', re.I),
-                re.compile(r'(\d+)\s*/\s*\d+'),
-                re.compile(r'(\d+)\s+/\s+\d+')
-            ]
+            # Extract experience from XP bar and table
+            exp_found = False
             
-            for pattern in exp_patterns:
-                match = pattern.search(html)
-                if match:
-                    try:
-                        player_data['experience'] = int(match.group(1).replace(' ', ''))
+            # Method 1: Extract from XP progress bar (.text_xp class)
+            xp_element = soup.find('div', class_='text_xp')
+            if xp_element:
+                xp_text = xp_element.get_text(strip=True)
+                # Extract the first number from "2 106 / 3 700" format
+                exp_match = re.search(r'(\d{1,3}(?:\s\d{3})*)', xp_text)
+                if exp_match:
+                    player_data['experience'] = int(exp_match.group(1).replace(' ', ''))
+                    exp_found = True
+            
+            # Method 2: Look for "По опыту" (By experience) in ratings table
+            if not exp_found:
+                for table in soup.find_all('table'):
+                    rows = table.find_all('tr')
+                    for row in rows:
+                        cells = row.find_all('td')
+                        if len(cells) >= 3:  # Need 3 columns: category, rank, value
+                            category = cells[0].get_text(strip=True).lower()
+                            value = cells[2].get_text(strip=True)
+                            
+                            if 'по опыту' in category or 'опыт' in category:
+                                # Extract number from experience value
+                                exp_match = re.search(r'(\d{1,3}(?:\s\d{3})*)', value)
+                                if exp_match:
+                                    player_data['experience'] = int(exp_match.group(1).replace(' ', ''))
+                                    exp_found = True
+                                    break
+                    if exp_found:
                         break
-                    except ValueError:
-                        continue
             
-            # Enhanced statistics extraction
-            stat_patterns = {
-                'kills': [r'уничтожил[:\s]*(\d+)', r'убийств[:\s]*(\d+)', r'kills[:\s]*(\d+)'],
-                'deaths': [r'подбит[:\s]*(\d+)', r'смертей[:\s]*(\d+)', r'deaths[:\s]*(\d+)'],
-                'destroyed': [r'уничтожено[:\s]*(\d+)', r'destroyed[:\s]*(\d+)'],
-                'hit': [r'попаданий[:\s]*(\d+)', r'hit[:\s]*(\d+)', r'hits[:\s]*(\d+)'],
-                'gold_boxes': [r'золотых ящиков[:\s]*(\d+)', r'gold.*boxes?[:\s]*(\d+)']
-            }
-            
-            for stat_name, patterns in stat_patterns.items():
-                for pattern in patterns:
-                    match = re.search(pattern, html, re.I)
-                    if match:
-                        try:
-                            player_data[stat_name] = int(match.group(1).replace(' ', ''))
-                            break
-                        except ValueError:
-                            continue
-            
-            # Calculate K/D ratio
-            if player_data['kills'] is not None and player_data['deaths'] is not None and player_data['deaths'] > 0:
-                player_data['kd_ratio'] = round(player_data['kills'] / player_data['deaths'], 2)
-            
-            # Extract from tables (fallback method)
+            # Extract kills, deaths, and K/D ratio from tables
             tables = soup.find_all('table')
             for table in tables:
                 rows = table.find_all('tr')
@@ -230,208 +231,156 @@ class RTanksScraper:
                         key = cells[0].get_text(strip=True).lower()
                         value = cells[1].get_text(strip=True)
                         
-                        if any(word in key for word in ['уничтожил', 'убийств', 'kills']):
-                            if value.isdigit():
-                                player_data['kills'] = int(value)
-                        elif any(word in key for word in ['подбит', 'смертей', 'deaths']):
-                            if value.isdigit():
-                                player_data['deaths'] = int(value)
-                        elif 'у/п' in key or 'k/d' in key:
+                        if 'уничтожил' in key or 'kills' in key:
+                            kills_value = int(re.sub(r'[^\d]', '', value) or 0)
+                            player_data['kills'] = kills_value
+                            player_data['destroyed'] = kills_value  # Use kills as destroyed
+                        elif 'подбит' in key or 'deaths' in key:
+                            player_data['deaths'] = int(re.sub(r'[^\d]', '', value) or 0)
+                        elif 'у/п' in key or 'k/d' in key or 'эффективность' in key:
                             try:
-                                player_data['kd_ratio'] = float(value)
-                            except ValueError:
+                                player_data['kd_ratio'] = float(value.replace(',', '.'))
+                            except:
                                 pass
-                        elif 'золотых ящиков' in key:
-                            if value.isdigit():
-                                player_data['gold_boxes'] = int(value)
-                        elif 'премиум' in key:
-                            player_data['premium'] = 'да' in value.lower()
-                        elif 'группа' in key:
-                            player_data['group'] = value
+                        elif 'премиум' in key or 'premium' in key:
+                            player_data['premium'] = 'да' in value.lower() or 'yes' in value.lower()
+                        elif 'золот' in key or 'gold' in key:
+                            player_data['goldboxes'] = int(re.sub(r'[^\d]', '', value) or 0)
             
-            # Enhanced equipment parsing (only turrets and hulls)
-            equipment_patterns = {
-                'turrets': [r'turret', r'пушк', r'орудие'],
-                'hulls': [r'hull', r'корпус', r'танк']
-            }
+            # Extract ranking positions from ratings table
+            # Find the table with "Места в текущих рейтингах" (Current rankings)
+            for table in soup.find_all('table'):
+                rows = table.find_all('tr')
+                for row in rows:
+                    cells = row.find_all('td')
+                    if len(cells) >= 3:  # category, rank, value
+                        category = cells[0].get_text(strip=True).lower()
+                        rank = cells[1].get_text(strip=True).replace('#', '')
+                        
+                        if 'по опыту' in category:
+                            player_data['experience_rank'] = rank if rank != '0' else 'N/A'
+                        elif 'голдоловов' in category or 'золот' in category:
+                            # This is goldboxes, we can skip rank but get the value
+                            pass
+                        elif 'по киллам' in category:
+                            player_data['kills_rank'] = rank if rank != '0' else 'N/A'
+                        elif 'по эффективности' in category:
+                            player_data['efficiency_rank'] = rank if rank != '0' else 'N/A'
             
-            # Look for equipment images and descriptions
-            imgs = soup.find_all('img')
-            for img in imgs:
-                src = str(img.get('src', '')).lower()
-                alt = str(img.get('alt', '')).lower()
-                title = str(img.get('title', '')).lower()
-                
-                for equip_type, patterns in equipment_patterns.items():
-                    if any(pattern in src or pattern in alt or pattern in title for pattern in patterns):
-                        equipment_name = alt or title or 'Unknown'
-                        if equipment_name and equipment_name != 'unknown' and equipment_name not in player_data['equipment'][equip_type]:
-                            player_data['equipment'][equip_type].append(equipment_name)
+            # Extract current equipment information - focus on turrets and hulls
+            equipment_sections = soup.find_all('div', class_=re.compile(r'equipment|loadout'))
+            equipment_parts = []
+            
+            # Look for equipment in various sections
+            for section in equipment_sections:
+                text = section.get_text(strip=True)
+                if text:
+                    equipment_parts.append(text)
+            
+            # Also check for equipment images
+            equipment_imgs = soup.find_all('img', alt=re.compile(r'turret|hull|пушка|корпус|орудие|танк', re.I))
+            for img in equipment_imgs:
+                alt_text = img.get('alt', '')
+                if alt_text and alt_text not in equipment_parts:
+                    equipment_parts.append(alt_text)
+            
+            if equipment_parts:
+                player_data['equipment'] = ' | '.join(equipment_parts[:5])  # Limit to 5 items
             
             return player_data
             
         except Exception as e:
-            logger.error(f"Error parsing player profile: {e}")
+            logger.error(f"Error parsing player data for {nickname}: {e}")
             return None
-
-    def get_rank_emoji(self, rank: str) -> str:
-        """Get appropriate emoji for player rank"""
-        rank = rank.lower()
-        rank_emojis = {
-            'генерал': '⭐',
-            'полковник': '🌟',
-            'подполковник': '✨',
-            'майор': '🎖️',
-            'капитан': '🏅',
-            'старший лейтенант': '🥇',
-            'лейтенант': '🥈',
-            'младший лейтенант': '🥉',
-            'старший прапорщик': '🎯',
-            'прапорщик': '🔰',
-            'старший сержант': '⚔️',
-            'сержант': '🛡️',
-            'младший сержант': '⚡',
-            'ефрейтор': '🔸',
-            'рядовой': '🔹'
-        }
-        return rank_emojis.get(rank, '🎖️')
     
-    async def get_player_stats(self, nickname: str) -> Optional[Dict]:
-        """Get player statistics from RTanks ratings"""
-        cache_key = f"player_{nickname}"
-        
-        # Check cache first
-        cached_data = self.get_from_cache(cache_key)
-        if cached_data:
-            return cached_data
-        
-        # Fetch from website
-        url = f"{self.base_url}/user/{nickname}"
-        html = await self.fetch_page(url)
-        
-        if not html:
-            return None
-        
-        player_data = self.parse_player_profile(html, nickname)
-        
-        if player_data:
-            self.set_cache(cache_key, player_data)
-        
-        return player_data
-    
-    def get_leaderboard_emoji(self, rank: int) -> str:
-        """Get appropriate emoji for leaderboard position"""
-        if rank == 1:
-            return '🥇'
-        elif rank == 2:
-            return '🥈'
-        elif rank == 3:
-            return '🥉'
-        elif rank <= 5:
-            return '🏅'
-        elif rank <= 10:
-            return '🎖️'
-        else:
-            return '🔸'
-    
-    def parse_leaderboard(self, html: str) -> List[Dict]:
-        """Parse leaderboard HTML with improved emoji handling"""
+    async def get_leaderboard(self, category: str) -> Optional[List[Dict]]:
+        """Get leaderboard data for specified category"""
         try:
-            soup = BeautifulSoup(html, 'html.parser')
-            players = []
+            # Map category to the appropriate section on the main page
+            if category == 'experience':
+                # Main page shows experience leaderboard by default
+                url = self.base_url
+            elif category == 'crystals':
+                # Crystal leaderboard is also on main page
+                url = self.base_url
+            else:
+                # For other categories, we'll parse what's available
+                url = self.base_url
             
-            # Find the leaderboard table
+            html_content = await self._fetch_page(url)
+            if not html_content:
+                return None
+            
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Find leaderboard tables
+            leaderboard_data = []
+            
+            # Look for the main leaderboard table
             tables = soup.find_all('table')
+            
             for table in tables:
                 rows = table.find_all('tr')
                 
                 for row in rows:
                     cells = row.find_all('td')
                     if len(cells) >= 3:
-                        # Extract rank, player name, and value
-                        rank_text = cells[0].get_text(strip=True)
-                        player_cell = cells[1]
-                        value_text = cells[2].get_text(strip=True)
-                        
-                        # Extract player name from link or img alt
-                        player_name = None
-                        player_link = player_cell.find('a')
-                        if player_link:
-                            player_name = player_link.get_text(strip=True)
-                        
-                        # Also check for img alt attribute
-                        if not player_name:
-                            img = player_cell.find('img')
-                            if img:
-                                player_name = img.get('alt', '').strip()
-                        
-                        # Try to extract from any text in the cell
-                        if not player_name:
-                            player_name = player_cell.get_text(strip=True)
-                        
-                        # Clean up player name
-                        if player_name:
-                            # Remove rank icons and other prefixes
-                            player_name = re.sub(r'^[\d\s]+', '', player_name).strip()
-                            player_name = re.sub(r'^\W+', '', player_name).strip()
-                        
-                        # Validate rank
-                        if rank_text.isdigit() and player_name and value_text:
-                            rank = int(rank_text)
+                        try:
+                            # Extract position, player info, and value
+                            position = cells[0].get_text(strip=True)
                             
-                            # Clean up value (remove non-numeric characters except spaces)
-                            value_clean = re.sub(r'[^\d\s]', '', value_text).strip()
-                            value_clean = value_clean.replace(' ', '')
-                            
-                            try:
-                                if value_clean:
-                                    value = int(value_clean)
-                                else:
+                            # Player cell contains image and name
+                            player_cell = cells[1]
+                            player_link = player_cell.find('a')
+                            if player_link:
+                                nickname = player_link.get_text(strip=True)
+                                
+                                # Extract rank from image
+                                rank_img = player_cell.find('img')
+                                rank = 'Unknown'
+                                if rank_img and rank_img.get('src'):
+                                    rank = self._extract_rank_from_image(rank_img['src'])
+                                
+                                # Extract value
+                                value_text = cells[2].get_text(strip=True)
+                                
+                                # Clean and parse value
+                                value_clean = re.sub(r'[^\d\s]', '', value_text)
+                                value_clean = value_clean.replace(' ', '')
+                                
+                                try:
+                                    value = int(value_clean) if value_clean else 0
+                                except ValueError:
                                     value = 0
-                            except ValueError:
-                                value = 0
-                            
-                            players.append({
-                                'rank': rank,
-                                'name': player_name,
-                                'value': value,
-                                'formatted_value': value_text,
-                                'emoji': self.get_leaderboard_emoji(rank)
-                            })
+                                
+                                # Validate position
+                                if position.isdigit() and 1 <= int(position) <= 100:
+                                    leaderboard_data.append({
+                                        'position': int(position),
+                                        'nickname': nickname,
+                                        'rank': rank,
+                                        'value': value,
+                                        'formatted_value': value_text
+                                    })
+                                    
+                        except Exception as e:
+                            logger.debug(f"Error parsing leaderboard row: {e}")
+                            continue
             
-            # Sort by rank and limit to top 10
-            players.sort(key=lambda x: x['rank'])
-            return players[:10]
+            # Sort by position and return top 10
+            leaderboard_data.sort(key=lambda x: x['position'])
+            return leaderboard_data[:10]
             
         except Exception as e:
-            logger.error(f"Error parsing leaderboard: {e}")
-            return []
-    
-    async def get_leaderboard(self, category: str) -> Optional[List[Dict]]:
-        """Get leaderboard for specified category"""
-        cache_key = f"leaderboard_{category}"
-        
-        # Check cache first
-        cached_data = self.get_from_cache(cache_key)
-        if cached_data:
-            return cached_data
-        
-        # Fetch main ratings page
-        url = self.base_url
-        html = await self.fetch_page(url)
-        
-        if not html:
+            logger.error(f"Error fetching leaderboard for {category}: {e}")
             return None
-        
-        # Parse leaderboard data
-        leaderboard_data = self.parse_leaderboard(html)
-        
-        if leaderboard_data:
-            self.set_cache(cache_key, leaderboard_data)
-        
-        return leaderboard_data
+    
+    async def close(self):
+        """Close the session"""
+        if self.session and not self.session.closed:
+            await self.session.close()
     
     def __del__(self):
         """Cleanup when scraper is destroyed"""
-        if self.session and not self.session.is_closed:
-            asyncio.create_task(self.close_session())
+        if hasattr(self, 'session') and self.session and not self.session.closed:
+            asyncio.create_task(self.close())
