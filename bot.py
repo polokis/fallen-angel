@@ -1,4 +1,4 @@
-import discord
+logger = import discord
 from discord.ext import commands, tasks
 import asyncio
 import os
@@ -10,8 +10,7 @@ from config import RANK_EMOJIS, LEADERBOARD_CATEGORIES, GOLDBOX_EMOJI
 from keep_alive import keep_alive
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)logging.getLogger(__name__)
 
 # Bot setup with required intents
 intents = discord.Intents.default()
